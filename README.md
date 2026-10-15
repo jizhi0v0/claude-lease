@@ -11,6 +11,8 @@ silently replaces the build another session is verifying. With it:
   session does not hold, and the block message says who holds it (session name
   from `ListAgents`, folder, branch, purpose, since/until), how many other
   sessions wait, and what to do next (queue, or your place if already queued).
+  It blocks even when the resource is free: the session must take the lease
+  before it uses the resource, so that it is on record while it does.
   A `SessionStart` hook puts the current state into every new session's context.
   A `SessionEnd` hook releases the ending session's leases and takes it out of
   every queue.
@@ -103,7 +105,9 @@ resources, so they do not take part.
 
 A `resources.json` that does not parse is an error: commands exit 1 and say so,
 and the hook lets every call through and logs it to
-`~/.claude/lease/hook-errors.log`. A missing file means no resources.
+`~/.claude/lease/hook-errors.log`. A missing file means no resources. Only
+parsing is checked up front; see "Known limits" for what happens with a bad
+regex.
 
 Lease what is actually shared and for as long as it is shared: for an app that
 is the deploy *and* the verification after it, not the compile before it.
@@ -126,9 +130,13 @@ claude-lease <command> --help     # the same usage text as claude-lease --help
 - `renew --minutes N` makes the lease last until N minutes from now
   (`ttl_minutes` without `--minutes`). It never shortens a lease: if the lease
   already lasts longer, it prints `UNCHANGED` and keeps the later time.
+- `acquire` requires `--purpose` (exit 2 without it), so that others can see
+  why the lease is held. `wait` takes it too and should be given the same
+  value; without it the lease it obtains shows no purpose.
 - `status` lists every resource present on this host, or the named ones. A
   named resource that is not configured is an error (exit 2); one that is
-  configured but not present on this host is listed as such.
+  configured but not present on this host is listed as such in the text
+  output, and left out of `--json` (see "Known limits").
 - Exit codes: 0 ok, 3 queued, 2 usage error, 1 failure.
 - `acquire`, `wait`, `release` and `renew` need to run inside a Claude Code
   session (they read `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID`); elsewhere they
@@ -144,7 +152,9 @@ The block message and the session-start context tell Claude all of this, so no
 CLAUDE.md instructions are needed.
 
 A queued session that has neither a running `wait` nor called `acquire` for
-120 s (`CLAUDE_LEASE_GRACE_SECONDS`) while the resource is free loses its turn.
+120 s (`CLAUDE_LEASE_GRACE_SECONDS`) while the resource is free loses its turn:
+it is removed from the queue, and has to `acquire` again, which puts it at the
+end.
 Waiters whose Claude Code process is gone are dropped. `status` and the hooks
 already show the queue without them; their queue files are deleted by the next
 `acquire`, `release` or check of any running `wait` (a running `wait` checks
@@ -174,6 +184,31 @@ shows the folder and branch of the session's latest `acquire` or `wait`.
   `~/.claude/lease/hook-errors.log`. Empty input is treated as no tool call,
   not as an error. A broken lease system must not break sessions.
 - One host. State lives in `~/.claude/lease/state/`.
+
+## Known limits
+
+Found by testing and left as they are for now.
+
+- **A `<<` inside quotes can hide later lines (lets a call through).** The
+  heredoc rule does not know about quotes, so in
+  `echo "a <<EOF"` followed by a newline and `make install`, everything after
+  the quoted `<<EOF` is taken for heredoc data and not checked, although bash
+  runs it. On one line (`echo "<<EOF"; make install`) it is still caught.
+- **`$'…'` strings are not understood (blocks too much).** In bash's ANSI-C
+  quoting a `\'` does not end the string; here it does, so text after it in
+  the same `$'…'`, such as a backtick or a `<<EOF`, can be read as a command
+  and the call blocked, although bash would run nothing. Plain `$'…'` strings
+  without `\'` are fine.
+- **Config errors other than parsing only show when used.** A bad regex is
+  noticed when the hook tries it: the hook then fails open for that call (for
+  every resource, not just the one with the bad regex) and logs it; `status`
+  still exits 0 and shows the resource as usual.
+- **`status --json` leaves out a resource that is not present on this host**,
+  also when it is named (`status gone --json` prints `{}`), where the text
+  output lists it as not present.
+- **A command bash cannot parse** (unbalanced quotes) is matched as one piece
+  of raw text, so it may be blocked or let through; bash would reject it and
+  run nothing either way.
 
 ## Test
 
