@@ -190,6 +190,10 @@ shows the folder and branch of the session's latest `acquire` or `wait`.
 
 Found by testing and left as they are for now.
 
+- **A `<<` inside a `#` comment can hide later lines (lets a call through).**
+  The heredoc rule does not know about comments, so in `# note <<EOF`
+  followed by a newline and `make install`, everything after the commented
+  `<<EOF` is taken for heredoc data and not checked, although bash runs it.
 - **`$'…'` strings are not fully understood (blocks too much).** In bash's
   ANSI-C quoting a `\'` does not end the string. Finding heredocs knows this;
   the rest of the matching does not, so text after a `\'` in the same `$'…'`,
