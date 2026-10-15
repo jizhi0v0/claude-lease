@@ -81,7 +81,8 @@ resources, so they do not take part.
     anything else (`cat`, `python3 -`, `git commit -F -`, `ssh`) it is data,
     except that with an unquoted delimiter (`<<EOF`) the local shell still
     runs the `` `…` `` and `$(…)` in it, whatever quotes surround them; with a
-    quoted delimiter (`<<'EOF'`, `<<"EOF"`) nothing in the body runs here;
+    quoted delimiter (`<<'EOF'`, `<<"EOF"`) nothing in the body runs here.
+    Only a `<<` outside quotes (`'…'`, `"…"`, `$'…'`) starts a heredoc;
   - in front of the real command, `VAR=value`, the keywords `if then else elif
     fi while until do done { } !` and the wrappers `time env command exec nohup
     builtin` are dropped, together with the wrappers' own options and those
@@ -189,16 +190,11 @@ shows the folder and branch of the session's latest `acquire` or `wait`.
 
 Found by testing and left as they are for now.
 
-- **A `<<` inside quotes can hide later lines (lets a call through).** The
-  heredoc rule does not know about quotes, so in
-  `echo "a <<EOF"` followed by a newline and `make install`, everything after
-  the quoted `<<EOF` is taken for heredoc data and not checked, although bash
-  runs it. On one line (`echo "<<EOF"; make install`) it is still caught.
-- **`$'…'` strings are not understood (blocks too much).** In bash's ANSI-C
-  quoting a `\'` does not end the string; here it does, so text after it in
-  the same `$'…'`, such as a backtick or a `<<EOF`, can be read as a command
-  and the call blocked, although bash would run nothing. Plain `$'…'` strings
-  without `\'` are fine.
+- **`$'…'` strings are not fully understood (blocks too much).** In bash's
+  ANSI-C quoting a `\'` does not end the string. Finding heredocs knows this;
+  the rest of the matching does not, so text after a `\'` in the same `$'…'`,
+  such as a backtick, can be read as a command and the call blocked, although
+  bash would run nothing. Plain `$'…'` strings without `\'` are fine.
 - **Config errors other than parsing only show when used.** A bad regex is
   noticed when the hook tries it: the hook then fails open for that call (for
   every resource, not just the one with the bad regex) and logs it; `status`

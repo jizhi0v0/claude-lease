@@ -412,6 +412,29 @@ class LeaseTest(unittest.TestCase):
         for c in not_local:
             self.assertIsNone(a.bash(c), "must not match: %r" % c)
 
+    def test_pretooluse_heredoc_operator_counts_only_outside_quotes(self):
+        a = Session(self, "a")
+        install = "make" + " install"
+        local = [
+            # A quoted << is text, so the next line is a command, not heredoc data.
+            "echo \"a <<EOF\"\n%s" % install,
+            "echo 'a <<EOF'\n%s" % install,
+            "echo $'a <<EOF'\n%s" % install,
+            "echo \"a \\\" <<EOF\"\n%s" % install,
+            "echo \"a\n<<EOF\"\n%s" % install,
+            "echo \"a <<EOF\" </dev/null\n%s" % install,
+            "echo \"<<EOF\"; %s" % install,
+        ]
+        not_local = [
+            # The << after a closed quote is still a heredoc.
+            "echo \"a\" <<EOF\n%s\nEOF" % install,
+            "echo 'it\"s' <<EOF\n%s\nEOF" % install,
+        ]
+        for c in local:
+            self.assertIsNotNone(a.bash(c), "must be treated as local: %r" % c)
+        for c in not_local:
+            self.assertIsNone(a.bash(c), "must not match: %r" % c)
+
     def test_pretooluse_skips_wrapper_options_and_their_values(self):
         a = Session(self, "a")
         install = "make" + " install"
