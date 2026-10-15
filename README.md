@@ -89,6 +89,12 @@ claude-lease release duo-app
 claude-lease status [--json]
 ```
 
+`--name` is the session's name as `ListAgents` shows it, so a blocked session
+can `SendMessage` the holder. When it is left out, it is read from Claude Code's
+own session file `~/.claude/sessions/$CLAUDE_PID.json`; that file is not a
+documented interface, so this is only a fallback and an unreadable file just
+leaves the name empty.
+
 The block message and the session-start context tell Claude all of this, so no
 CLAUDE.md instructions are needed.
 

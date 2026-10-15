@@ -85,7 +85,7 @@ class LeaseTest(unittest.TestCase):
             json.dump(CONFIG, f)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
         self.env.update(CLAUDE_LEASE_HOME=self.home, CLAUDE_LEASE_TICK_SECONDS="0.1",
-                        CLAUDE_LEASE_GRACE_SECONDS="60")
+                        CLAUDE_LEASE_GRACE_SECONDS="60", HOME=self.home)
         self.addCleanup(self.kill_holders)
 
     def kill_holders(self):
@@ -123,6 +123,26 @@ class LeaseTest(unittest.TestCase):
         self.assertIn("QUEUED app: position 1 of 1; held by S-a", r.stdout)
         self.assertEqual(self.acquire(a).returncode, 0)  # re-acquire by holder is a no-op
         self.assertIn("ALREADY HELD", self.acquire(a).stdout)
+
+    def write_registry(self, s, content):
+        d = os.path.join(self.home, ".claude", "sessions")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "%d.json" % s.pid), "w") as f:
+            f.write(content)
+
+    def test_name_falls_back_to_claude_session_registry(self):
+        a, b, c = Session(self, "a"), Session(self, "b"), Session(self, "c")
+        self.write_registry(a, json.dumps({"sessionId": "a", "name": "Registry Name", "status": "busy"}))
+        self.write_registry(b, json.dumps({"name": "Ignored"}))
+        self.write_registry(c, "{not json")
+        self.assertEqual(a.run("acquire", "app", "--purpose", "p").returncode, 0)
+        self.assertEqual(self.holder()["name"], "Registry Name")
+        a.run("release", "app")
+        self.assertEqual(b.run("acquire", "app", "--name", "Given", "--purpose", "p").returncode, 0)
+        self.assertEqual(self.holder()["name"], "Given", "an explicit --name wins")
+        b.run("release", "app")
+        self.assertEqual(c.run("acquire", "app", "--purpose", "p").returncode, 0)
+        self.assertEqual(self.holder()["name"], "", "unreadable registry: no name, as before")
 
     def test_purpose_is_required(self):
         a = Session(self, "a")

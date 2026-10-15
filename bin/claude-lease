@@ -151,6 +151,14 @@ def queue(res):
     return out
 
 
+def registry_name(pid):
+    """The session's name as other sessions list it, from Claude Code's own
+    per-process session file. Undocumented, so only a fallback for --name."""
+    rec = read_json(os.path.expanduser("~/.claude/sessions/%s.json" % pid))
+    name = rec.get("name") if isinstance(rec, dict) else None
+    return name if isinstance(name, str) else ""
+
+
 def identity(args):
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
     pid = os.environ.get("CLAUDE_PID")
@@ -164,7 +172,7 @@ def identity(args):
     return {
         "session_id": sid,
         "claude_pid": int(pid),
-        "name": args.get("name") or "",
+        "name": args.get("name") or registry_name(pid),
         "socket": os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET", ""),
         "cwd": os.getcwd(),
         "branch": branch,
@@ -659,13 +667,14 @@ def cmd_hook(pos):
 # ---------------------------------------------------------------- main
 
 USAGE = """usage:
-  claude-lease acquire <resource> --name NAME --purpose WHY [--minutes N] [--urgent]
-  claude-lease wait    <resource> --name NAME --purpose WHY [--minutes N]   (run in background)
+  claude-lease acquire <resource> [--name NAME] --purpose WHY [--minutes N] [--urgent]
+  claude-lease wait    <resource> [--name NAME] --purpose WHY [--minutes N]   (run in background)
   claude-lease release <resource>
   claude-lease renew   <resource> [--minutes N]
   claude-lease status  [resource...] [--json]
   claude-lease hook    pretooluse|sessionstart|sessionend                  (stdin: hook JSON)
 
+--name defaults to the session's name in ~/.claude/sessions/$CLAUDE_PID.json.
 Exit codes: 0 ok, 3 queued, 2 usage error, 1 failure."""
 
 
