@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""claude-lease: advisory, queued leases on shared machine resources for
+concurrent Claude Code sessions on one host.
+
+A lease is held by a detached holder process that keeps an flock on the
+resource's lock file and exits (releasing it) when the owning Claude Code
+process dies, the lease expires, or the lease is released. Waiters queue
+first-come-first-served; `wait` is meant to run as a background Bash task so
+the waiting session is woken when it is its turn.
+
+Identity comes from variables Claude Code exports to Bash and hook
+subprocesses: CLAUDE_CODE_SESSION_ID, CLAUDE_PID, CLAUDE_CODE_MESSAGING_SOCKET.
+"""
+
+import contextlib
+import errno
+import fcntl
+import json
+import os
+import re
+import select
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser(os.environ.get("CLAUDE_LEASE_HOME", "~/.claude/lease"))
+CONFIG = os.path.join(HOME, "resources.json")
+STATE = os.path.join(HOME, "state")
+# How long the head of the queue may sit without a running `wait` while the
+# resource is free before it loses its turn.
+GRACE = float(os.environ.get("CLAUDE_LEASE_GRACE_SECONDS", "120"))
+TICK = float(os.environ.get("CLAUDE_LEASE_TICK_SECONDS", "1"))
+DEFAULT_MINUTES = 20.0
+
+EXIT_QUEUED = 3
+EXIT_USAGE = 2
+
+PROTOCOL = (
+    "Protocol: before using a shared resource run `claude-lease acquire <resource> "
+    "--name '<this session's name from ListAgents>' --purpose '<why>'`. "
+    "If it prints QUEUED, run `claude-lease wait <resource>` (same flags) with "
+    "run_in_background and keep doing other work; you are woken when it is your turn. "
+    "Run `claude-lease release <resource>` as soon as you are done (including verification). "
+    "`claude-lease renew <resource> --minutes N` extends a lease; `claude-lease status` shows everything. "
+    "Order is first come, first served; do not jump the queue unless the user tells you to (--urgent)."
+)
+
+
+# ---------------------------------------------------------------- utilities
+
+def now():
+    return time.time()
+
+
+def hhmm(ts):
+    return time.strftime("%H:%M", time.localtime(ts)) if ts else "?"
+
+
+def pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        return e.errno == errno.EPERM
+    return True
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def remove(path):
+    with contextlib.suppress(OSError):
+        os.remove(path)
+
+
+def load_config():
+    data = read_json(CONFIG) or {}
+    resources = data.get("resources") or {}
+    return {k: v for k, v in resources.items() if isinstance(v, dict)}
+
+
+def present(spec):
+    path = spec.get("present_if_exists")
+    return not path or os.path.exists(os.path.expanduser(path))
+
+
+def rdir(res):
+    d = os.path.join(STATE, res)
+    os.makedirs(os.path.join(d, "queue"), exist_ok=True)
+    return d
+
+
+@contextlib.contextmanager
+def mutex(res):
+    with open(os.path.join(rdir(res), "mutex"), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def lock_is_free(res):
+    """Probe the lease lock. Only call while holding the resource mutex."""
+    with open(os.path.join(rdir(res), "lock"), "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return True
+
+
+def holder(res):
+    """The current holder record, or None. Lock-free read, safe in hooks."""
+    h = read_json(os.path.join(rdir(res), "holder.json"))
+    if h and pid_alive(h.get("holder_pid")):
+        return h
+    return None
+
+
+def queue(res):
+    qd = os.path.join(rdir(res), "queue")
+    out = []
+    for name in sorted(os.listdir(qd)):
+        if name.endswith(".json"):
+            e = read_json(os.path.join(qd, name))
+            if e:
+                e["_file"] = os.path.join(qd, name)
+                out.append(e)
+    return out
+
+
+def identity(args):
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    pid = os.environ.get("CLAUDE_PID")
+    if not sid or not pid:
+        die("claude-lease must run inside a Claude Code session "
+            "(CLAUDE_CODE_SESSION_ID and CLAUDE_PID are not set).")
+    branch = ""
+    with contextlib.suppress(Exception):
+        branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True, timeout=2).stdout.strip()
+    return {
+        "session_id": sid,
+        "claude_pid": int(pid),
+        "name": args.get("name") or "",
+        "socket": os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET", ""),
+        "cwd": os.getcwd(),
+        "branch": branch,
+        "host": socket.gethostname(),
+        "purpose": args.get("purpose") or "",
+    }
+
+
+def who(e):
+    name = e.get("name") or "(unnamed; session %s)" % e.get("session_id", "?")[:8]
+    where = e.get("cwd", "")
+    if e.get("branch"):
+        where += " @ " + e["branch"]
+    return "%s [%s]" % (name, where)
+
+
+def die(msg, code=EXIT_USAGE):
+    print("claude-lease: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- core
+
+def prune(res, held):
+    """Drop dead waiters and, while the resource is free, a head that has not
+    been seen for GRACE seconds. Mutex held."""
+    d = rdir(res)
+    q = queue(res)
+    for e in q:
+        if not pid_alive(e.get("claude_pid")):
+            remove(e["_file"])
+    q = [e for e in q if pid_alive(e.get("claude_pid"))]
+    if not held:
+        fs_path = os.path.join(d, "free_since")
+        free_since = read_json(fs_path)
+        if not isinstance(free_since, (int, float)):
+            free_since = now()
+            write_json(fs_path, free_since)
+        while q and now() - max(free_since, q[0].get("last_seen", 0)) > GRACE:
+            remove(q[0]["_file"])
+            q.pop(0)
+    return q
+
+
+def spawn_holder(res, claude_pid):
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_hold", res, str(claude_pid)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    ready, _, _ = select.select([p.stdout], [], [], 5)
+    line = p.stdout.readline().strip() if ready else b""
+    p.stdout.close()
+    if line != b"ok":
+        with contextlib.suppress(OSError):
+            p.kill()
+        return None
+    return p.pid
+
+
+def touch(res, session_id):
+    """Every call from a queued session counts as it still waiting. Mutex held."""
+    for e in queue(res):
+        if e.get("session_id") == session_id:
+            path = e.pop("_file")
+            e["last_seen"] = now()
+            write_json(path, e)
+
+
+def try_acquire(res, ident, minutes, urgent=False):
+    """Returns (state, record): state is acquired | already | queued."""
+    d = rdir(res)
+    with mutex(res):
+        h = holder(res)
+        if h and h.get("session_id") == ident["session_id"]:
+            return "already", h
+        # No live holder record but the lock is taken: a holder between losing
+        # its record and exiting. Treat the resource as held.
+        held = h is not None or not lock_is_free(res)
+        if h is None:
+            remove(os.path.join(d, "holder.json"))
+        touch(res, ident["session_id"])
+        q = prune(res, held)
+        mine = [e for e in q if e.get("session_id") == ident["session_id"]]
+        if not held and (not q or (mine and q[0] is mine[0]) or urgent):
+            pid = spawn_holder(res, ident["claude_pid"])
+            if pid is None:
+                die("could not start the holder process for %s" % res, 1)
+            rec = dict(ident, holder_pid=pid, acquired_at=now(),
+                       expires_at=now() + minutes * 60, urgent=bool(urgent))
+            write_json(os.path.join(d, "holder.json"), rec)
+            remove(os.path.join(d, "free_since"))
+            for e in mine:
+                remove(e["_file"])
+            return "acquired", rec
+        if mine:
+            entry = mine[0]
+            path = entry.pop("_file")
+            entry.update({k: v for k, v in ident.items() if v})
+            write_json(path, entry)
+        else:
+            prefix = "%020d" % (0 if urgent else int(now() * 1e6))
+            entry = dict(ident, enqueued_at=now(), last_seen=now(), urgent=bool(urgent))
+            write_json(os.path.join(d, "queue", "%s-%s.json" % (prefix, ident["session_id"])), entry)
+        q = queue(res)
+        pos = next(i for i, e in enumerate(q) if e.get("session_id") == ident["session_id"]) + 1
+        return "queued", {"position": pos, "holder": h, "queue_length": len(q)}
+
+
+def release(res, session_id):
+    """Release the session's lease. Returns the queue as it stands right after
+    (next in line first), or None if the session did not hold the lease."""
+    d = rdir(res)
+    with mutex(res):
+        h = holder(res)
+        if not h or h.get("session_id") != session_id:
+            return None
+        remove(os.path.join(d, "holder.json"))
+        with contextlib.suppress(OSError):
+            os.kill(int(h["holder_pid"]), signal.SIGTERM)
+        deadline = now() + 3
+        while not lock_is_free(res) and now() < deadline:
+            time.sleep(0.05)
+        write_json(os.path.join(d, "free_since"), now())
+        return prune(res, False)
+
+
+def hold(res, claude_pid):
+    """Detached holder: keep the flock until the owner dies, the lease expires,
+    or holder.json no longer names this process."""
+    d = rdir(res)
+    f = open(os.path.join(d, "lock"), "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(1)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    os.write(1, b"ok\n")
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    me = os.getpid()
+    claimed = False
+    started = now()
+    try:
+        while True:
+            time.sleep(TICK)
+            if not pid_alive(claude_pid):
+                break
+            h = read_json(os.path.join(d, "holder.json"))
+            if h and h.get("holder_pid") == me:
+                claimed = True
+                if now() > float(h.get("expires_at", 0)):
+                    break
+            elif claimed or now() - started > 10:
+                # Released (record removed or replaced), or the process that
+                # spawned us never wrote the record.
+                break
+    finally:
+        h = read_json(os.path.join(d, "holder.json"))
+        if h and h.get("holder_pid") == me:
+            remove(os.path.join(d, "holder.json"))
+        write_json(os.path.join(d, "free_since"), now())
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------- commands
+
+def parse(argv):
+    """Tiny parser: positional args plus --name/--purpose/--minutes/--urgent/--json."""
+    pos, opts = [], {}
+    it = iter(argv)
+    for a in it:
+        if a in ("--urgent", "--json"):
+            opts[a[2:]] = True
+        elif a in ("--name", "--purpose", "--minutes"):
+            try:
+                opts[a[2:]] = next(it)
+            except StopIteration:
+                die("%s needs a value" % a)
+        elif a.startswith("--"):
+            die("unknown option %s" % a)
+        else:
+            pos.append(a)
+    return pos, opts
+
+
+def need_resource(pos, config):
+    if not pos:
+        die("which resource? configured: %s" % (", ".join(sorted(config)) or "none"))
+    res = pos[0]
+    if res not in config:
+        die("unknown resource %r; configured: %s (%s)" % (res, ", ".join(sorted(config)) or "none", CONFIG))
+    return res
+
+
+def minutes_for(opts, spec):
+    try:
+        return float(opts.get("minutes") or spec.get("ttl_minutes") or DEFAULT_MINUTES)
+    except ValueError:
+        die("--minutes must be a number")
+
+
+def report_queued(res, info):
+    h = info.get("holder")
+    held = ("held by %s for: %s (until %s)" % (who(h), h.get("purpose") or "?", hhmm(h.get("expires_at")))
+            if h else "others are ahead of you")
+    print("QUEUED %s: position %d of %d; %s." % (res, info["position"], info.get("queue_length", info["position"]), held))
+    print("Run `claude-lease wait %s` with the same flags as a background task and continue other work." % res)
+
+
+def cmd_acquire(pos, opts, config):
+    res = need_resource(pos, config)
+    if not opts.get("purpose"):
+        die("--purpose is required so other sessions can see why you hold %s" % res)
+    ident = identity(opts)
+    state, info = try_acquire(res, ident, minutes_for(opts, config[res]), urgent=opts.get("urgent"))
+    if state in ("acquired", "already"):
+        print("%s %s until %s. Release with `claude-lease release %s` when done."
+              % ("ACQUIRED" if state == "acquired" else "ALREADY HELD", res, hhmm(info["expires_at"]), res))
+        return 0
+    report_queued(res, info)
+    return EXIT_QUEUED
+
+
+def cmd_wait(pos, opts, config):
+    res = need_resource(pos, config)
+    ident = identity(opts)
+    minutes = minutes_for(opts, config[res])
+    while True:
+        state, info = try_acquire(res, ident, minutes, urgent=opts.get("urgent"))
+        if state in ("acquired", "already"):
+            print("ACQUIRED %s until %s (your turn came). Release with `claude-lease release %s` when done."
+                  % (res, hhmm(info["expires_at"]), res))
+            return 0
+        if not pid_alive(ident["claude_pid"]):
+            return 1
+        time.sleep(TICK)
+
+
+def cmd_release(pos, opts, config):
+    res = need_resource(pos, config)
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or die("not inside a Claude Code session")
+    nxt = release(res, sid)
+    if nxt is not None:
+        print("RELEASED %s.%s" % (res, (" Next in line: %s." % who(nxt[0])) if nxt else ""))
+        return 0
+    with mutex(res):
+        for e in queue(res):
+            if e.get("session_id") == sid:
+                remove(e["_file"])
+                print("LEFT the queue for %s." % res)
+                return 0
+    print("You do not hold %s." % res)
+    return 1
+
+
+def cmd_renew(pos, opts, config):
+    res = need_resource(pos, config)
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or die("not inside a Claude Code session")
+    minutes = minutes_for(opts, config[res])
+    with mutex(res):
+        h = holder(res)
+        if not h or h.get("session_id") != sid:
+            print("You do not hold %s." % res)
+            return 1
+        h["expires_at"] = now() + minutes * 60
+        write_json(os.path.join(rdir(res), "holder.json"), h)
+    print("RENEWED %s until %s." % (res, hhmm(h["expires_at"])))
+    return 0
+
+
+def snapshot(config):
+    out = {}
+    for res, spec in sorted(config.items()):
+        if not present(spec):
+            continue
+        out[res] = {"description": spec.get("description", ""),
+                    "holder": holder(res),
+                    "queue": [{k: v for k, v in e.items() if k != "_file"} for e in queue(res)
+                              if pid_alive(e.get("claude_pid"))]}
+    return out
+
+
+def describe(snap):
+    lines = []
+    for res, s in snap.items():
+        h = s["holder"]
+        state = ("held by %s for: %s (since %s, until %s)"
+                 % (who(h), h.get("purpose") or "?", hhmm(h.get("acquired_at")), hhmm(h.get("expires_at")))
+                 if h else "free")
+        q = s["queue"]
+        lines.append("- %s: %s%s" % (res, state, ("; waiting: " + ", ".join(who(e) for e in q)) if q else ""))
+    return "\n".join(lines)
+
+
+def cmd_status(pos, opts, config):
+    snap = snapshot({k: v for k, v in config.items() if not pos or k in pos})
+    if opts.get("json"):
+        print(json.dumps(snap, indent=1))
+    else:
+        print(describe(snap) or "No resources configured for this host (%s)." % CONFIG)
+    return 0
+
+
+# ---------------------------------------------------------------- hooks
+
+def is_lease_only(command):
+    """True when the Bash command is a single claude-lease invocation, so its
+    --purpose text cannot trip a resource pattern. Anything chained to it is
+    checked like any other command."""
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return False
+    if not tokens or os.path.basename(tokens[0]) != "claude-lease" or "\n" in command:
+        return False
+    return not any(t and set(t) <= set(";&|()<>") for t in tokens)
+
+
+def matches(spec, tool, text):
+    for rule in spec.get("match") or []:
+        if re.search(rule.get("tool", "$^"), tool) and (
+                "input" not in rule or re.search(rule["input"], text)):
+            return True
+    return False
+
+
+def hook_pretooluse(data, config):
+    tool = data.get("tool_name") or ""
+    tin = data.get("tool_input") or {}
+    text = tin.get("command") if tool == "Bash" and isinstance(tin.get("command"), str) else json.dumps(tin)
+    if tool == "Bash" and is_lease_only(text):
+        return None
+    sid = data.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    reasons = []
+    for res, spec in sorted(config.items()):
+        if not present(spec) or not matches(spec, tool, text):
+            continue
+        h = holder(res)
+        if h and h.get("session_id") == sid:
+            continue
+        waiting = [e for e in queue(res) if pid_alive(e.get("claude_pid"))]
+        desc = (" (%s)" % spec["description"]) if spec.get("description") else ""
+        if h:
+            msg = ("[claude-lease] %s%s is held by %s for: %s (since %s, until %s); %d waiting. "
+                   "Join the queue with `claude-lease acquire %s --name '<your ListAgents name>' --purpose '<why>'`, "
+                   "then if it prints QUEUED run `claude-lease wait %s` (same flags) with run_in_background "
+                   "and do other work until it wakes you. Do not work around the lease."
+                   % (res, desc, who(h), h.get("purpose") or "?", hhmm(h.get("acquired_at")),
+                      hhmm(h.get("expires_at")), len(waiting), res, res))
+            if h.get("name"):
+                msg += " To coordinate, SendMessage to %s." % h["name"]
+        else:
+            msg = ("[claude-lease] %s%s is shared by every Claude session on this machine. Take the lease first: "
+                   "`claude-lease acquire %s --name '<your ListAgents name>' --purpose '<why>'`, then retry, and "
+                   "run `claude-lease release %s` as soon as you have finished (including verification)."
+                   % (res, desc, res, res))
+            if waiting:
+                msg += " %d session(s) are already waiting; you will be queued behind them." % len(waiting)
+        reasons.append(msg)
+    if not reasons:
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                   "permissionDecision": "deny",
+                                   "permissionDecisionReason": "\n".join(reasons)}}
+
+
+def hook_sessionstart(data, config):
+    snap = snapshot(config)
+    if not snap:
+        return None
+    ctx = ("[claude-lease] Shared resources on this machine:\n%s\n%s" % (describe(snap), PROTOCOL))
+    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}
+
+
+def hook_sessionend(data, config):
+    sid = data.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not sid:
+        return None
+    for res in config:
+        release(res, sid)
+        with mutex(res):
+            for e in queue(res):
+                if e.get("session_id") == sid:
+                    remove(e["_file"])
+    return None
+
+
+HOOKS = {"pretooluse": hook_pretooluse, "sessionstart": hook_sessionstart, "sessionend": hook_sessionend}
+
+
+def cmd_hook(pos):
+    """Fail open: a broken lease system must never break a Claude session."""
+    try:
+        raw = sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else {}
+        out = HOOKS[pos[0]](data, load_config())
+        if out:
+            print(json.dumps(out))
+    except Exception as e:  # noqa: BLE001 — fail open, but leave a trace
+        with contextlib.suppress(Exception):
+            os.makedirs(HOME, exist_ok=True)
+            with open(os.path.join(HOME, "hook-errors.log"), "a") as f:
+                f.write("%s %s %r\n" % (time.strftime("%F %T"), pos[:1], e))
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+USAGE = """usage:
+  claude-lease acquire <resource> --name NAME --purpose WHY [--minutes N] [--urgent]
+  claude-lease wait    <resource> --name NAME --purpose WHY [--minutes N]   (run in background)
+  claude-lease release <resource>
+  claude-lease renew   <resource> [--minutes N]
+  claude-lease status  [resource...] [--json]
+  claude-lease hook    pretooluse|sessionstart|sessionend                  (stdin: hook JSON)
+
+Exit codes: 0 ok, 3 queued, 2 usage error, 1 failure."""
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "hook":
+        if not rest or rest[0] not in HOOKS:
+            die("hook needs one of: " + ", ".join(HOOKS))
+        return cmd_hook(rest)
+    if cmd == "_hold":
+        hold(rest[0], int(rest[1]))
+        return 0
+    pos, opts = parse(rest)
+    config = load_config()
+    commands = {"acquire": cmd_acquire, "wait": cmd_wait, "release": cmd_release,
+                "renew": cmd_renew, "status": cmd_status}
+    if cmd not in commands:
+        die("unknown command %r\n%s" % (cmd, USAGE))
+    return commands[cmd](pos, opts, config)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
