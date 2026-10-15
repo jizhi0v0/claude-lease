@@ -17,7 +17,7 @@ CONFIG = {
         "app": {
             "description": "the installed app",
             "ttl_minutes": 20,
-            "match": [{"tool": "^Bash$", "input": r"(^|[;&|]\s*)make\s+install\b"}],
+            "match": [{"tool": "^Bash$", "input": r"^make\s+install(\s|$)"}],
         },
         "screen": {"match": [{"tool": r"^mcp__computer-use__computer_batch$"}]},
         "absent": {
@@ -261,6 +261,35 @@ class LeaseTest(unittest.TestCase):
         self.assertIsNone(a.bash("grep 'make install' Makefile"))
         self.assertIsNone(a.bash("echo absent-thing"))
         self.assertIsNone(a.hook("pretooluse", {"tool_name": "Read", "tool_input": {"file_path": "/x"}}))
+
+    def test_pretooluse_matches_local_simple_commands_only(self):
+        a = Session(self, "a")
+        install = "make" + " install"
+        local = [
+            "cd ~/x && %s" % install,
+            "cd ~/x\n%s" % install,
+            "git pull\n%s 2>&1 | tail -5" % install,
+            "%s 2>&1 | tail -5" % install,
+            "FOO=1 %s" % install,
+            "(%s)" % install,
+            "bash <<'EOF'\ncd x\n%s\nEOF" % install,
+            "cd x && \\\n  %s" % install,
+        ]
+        not_local = [
+            "ssh mini 'cd x && %s'" % install,
+            "ssh mini 'echo a; %s; echo b'" % install,
+            "ssh -o BatchMode=yes mini \"cd x; %s 2>&1 | tail\"" % install,
+            "ssh mini <<'EOF'\ncd x\n%s\nEOF" % install,
+            "cd x && ssh mini <<EOF\n%s\nEOF\necho done" % install,
+            "echo 'next: cd x; %s'" % install,
+            'git commit -m "fix: %s; then verify"' % install,
+            "grep '%s' Makefile" % install,
+            "%s-tools" % install,
+        ]
+        for c in local:
+            self.assertIsNotNone(a.bash(c), "must be treated as local: %r" % c)
+        for c in not_local:
+            self.assertIsNone(a.bash(c), "must not match: %r" % c)
 
     def test_pretooluse_mcp_tool(self):
         a = Session(self, "a")

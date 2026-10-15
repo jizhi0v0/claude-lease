@@ -5,14 +5,19 @@
       "ttl_minutes": 20,
       "present_if_exists": "/Applications/DuoUpdater.app",
       "match": [
-        {"tool": "^Bash$", "input": "(^|[;&|(]\\s*)(make\\s+install|\\S*scripts/install\\.sh)(?=$|[\\s;&|)])"}
+        {
+          "tool": "^Bash$",
+          "input": "^(make\\s+install|\\S*scripts/install\\.sh)(\\s|$)"
+        }
       ]
     },
     "screen": {
       "description": "full-screen computer use (real mouse and keyboard); background app_* tools are not covered",
       "ttl_minutes": 10,
       "match": [
-        {"tool": "^mcp__computer-use__(computer_batch|request_full_control)$"}
+        {
+          "tool": "^mcp__computer-use__(computer_batch|request_full_control)$"
+        }
       ]
     }
   }

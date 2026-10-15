@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Install claude-lease for this user on this host.
 
-  ./install.py                     link the CLI, create an empty resources.json
+  ./install.py                     install the CLI (a copy, so editing this checkout
+                                   changes nothing until the next install), create an
+                                   empty resources.json
   ./install.py --hooks             also register the hooks in ~/.claude/settings.json
   ./install.py --hooks --dry-run   print what --hooks would write, change nothing
   ./install.py --settings PATH     register the hooks in another settings file
@@ -22,18 +24,37 @@ BIN = os.path.join(REPO, "bin", "claude-lease")
 LINK = os.path.expanduser("~/.local/bin/claude-lease")
 HOME = os.path.expanduser(os.environ.get("CLAUDE_LEASE_HOME", "~/.claude/lease"))
 CONFIG = os.path.join(HOME, "resources.json")
+INSTALLED = os.path.join(HOME, "bin", "claude-lease")
 MARK = "claude-lease hook "
 
 
-def link_cli():
+def install_cli():
+    """Copy the CLI out of the checkout so that editing the checkout never
+    changes what running sessions' hooks execute until the next install."""
+    source = open(BIN).read()
+    compile(source, BIN, "exec")  # refuse to install a file that does not parse
+    os.makedirs(os.path.dirname(INSTALLED), exist_ok=True)
+    tmp = INSTALLED + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(source)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, INSTALLED)
+    print("Installed %s" % INSTALLED)
     os.makedirs(os.path.dirname(LINK), exist_ok=True)
     if os.path.islink(LINK) or os.path.exists(LINK):
-        if os.path.realpath(LINK) == os.path.realpath(BIN):
-            print("CLI already linked: %s" % LINK)
+        target = os.path.realpath(LINK)
+        if target == os.path.realpath(INSTALLED):
             return
-        sys.exit("%s exists and is not this checkout's claude-lease; move it away first." % LINK)
-    os.symlink(BIN, LINK)
-    print("Linked %s -> %s" % (LINK, BIN))
+        if target != os.path.realpath(BIN):
+            sys.exit("%s exists and is not claude-lease's; move it away first." % LINK)
+        # An older install linked straight to the checkout; swap atomically so a
+        # hook starting right now still finds a file.
+    tmp_link = LINK + ".tmp"
+    if os.path.lexists(tmp_link):
+        os.remove(tmp_link)
+    os.symlink(INSTALLED, tmp_link)
+    os.replace(tmp_link, LINK)
+    print("Linked %s -> %s" % (LINK, INSTALLED))
 
 
 def ensure_config():
@@ -120,7 +141,7 @@ def main(argv):
         settings = os.path.abspath(argv[argv.index("--settings") + 1])
     dry = "--dry-run" in argv
     if not dry:
-        link_cli()
+        install_cli()
         ensure_config()
     if "--hooks" in argv or "--remove-hooks" in argv or "--settings" in argv:
         write_settings(settings, "--remove-hooks" in argv, dry)

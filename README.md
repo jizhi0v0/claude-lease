@@ -25,13 +25,15 @@ silently replaces the build another session is verifying. With it:
 ```bash
 git clone https://github.com/jizhi0v0/claude-lease.git ~/Developer/github/claude-lease
 cd ~/Developer/github/claude-lease
-./install.py                     # links ~/.local/bin/claude-lease, creates ~/.claude/lease/resources.json
+./install.py                     # copies the CLI to ~/.claude/lease/bin, links ~/.local/bin/claude-lease, creates resources.json
 $EDITOR ~/.claude/lease/resources.json   # see examples/resources.json
 ./install.py --hooks --dry-run   # preview the hooks section
 ./install.py --hooks             # register the hooks in ~/.claude/settings.json (backs it up first)
 ```
 
-Re-run `./install.py --hooks` after changing any `"tool"` pattern: the
+The CLI is copied, not linked, so editing the checkout does not change what
+running sessions execute; re-run `./install.py` to ship a change (it refuses a
+file that does not parse). Re-run `./install.py --hooks` after changing any `"tool"` pattern: the
 `PreToolUse` matcher is built from them, so other tools never start the hook.
 `./install.py --remove-hooks` takes the hooks out again. Hooks are reloaded by
 running sessions within a couple of seconds.
@@ -54,7 +56,7 @@ resources, so they do not take part.
       "ttl_minutes": 20,
       "present_if_exists": "/Applications/DuoUpdater.app",
       "match": [
-        {"tool": "^Bash$", "input": "(^|[;&|(]\\s*)(make\\s+install|\\S*scripts/install\\.sh)(?=$|[\\s;&|)])"}
+        {"tool": "^Bash$", "input": "^(make\\s+install|\\S*scripts/install\\.sh)(\\s|$)"}
       ]
     }
   }
@@ -62,8 +64,14 @@ resources, so they do not take part.
 ```
 
 - `match`: a tool call uses the resource when `tool` matches the tool name and,
-  if given, `input` matches the Bash command (or the JSON of any other tool's
-  input). Regexes, Python syntax.
+  if given, `input` matches. Regexes, Python syntax. For Bash, `input` is tried
+  against each simple command that runs on this host: the command is split on
+  newlines, `;`, `&&`, `||`, `|`, `&` and parentheses with quotes respected,
+  leading `VAR=value` is dropped, and anything handed to `ssh` (arguments or a
+  heredoc) is left out, because it runs on another host. So anchor patterns
+  with `^`: `^make\s+install(\s|$)` matches `cd x && make install` but not
+  `git commit -m "… make install …"` or `ssh mini 'make install'`.
+  For other tools `input` is tried against the JSON of the tool input.
 - `present_if_exists`: skip the resource on hosts where this path is missing.
 - `ttl_minutes`: default lease length (`--minutes` overrides, `renew` extends).
 
@@ -91,7 +99,10 @@ Waiters whose Claude Code process is gone are dropped.
 ## Guarantees and limits
 
 - Advisory: it only governs tool calls that match a rule. A command spelled
-  differently, or a human in a terminal, is not stopped.
+  differently (`bash -c '…'`, `sudo …`, a wrapper script), or a human in a
+  terminal, is not stopped.
+- `ssh host '…'` is never matched: the host it reaches has its own leases
+  (install claude-lease there), and a lease cannot be held across hosts.
 - The hook fails open: any error leaves the call alone and is logged to
   `~/.claude/lease/hook-errors.log`. A broken lease system must not break sessions.
 - One host. State lives in `~/.claude/lease/state/`.
