@@ -39,13 +39,15 @@ EXIT_QUEUED = 3
 EXIT_USAGE = 2
 
 PROTOCOL = (
-    "Protocol: before using a shared resource run `claude-lease acquire <resource> "
-    "--name '<this session's name from ListAgents>' --purpose '<why>'`. "
-    "If it prints QUEUED, run `claude-lease wait <resource>` (same flags) with "
+    "Protocol: before using a shared resource run `claude-lease acquire <resource> --purpose '<why>'`. "
+    "If it prints QUEUED, run `claude-lease wait <resource> --purpose '<why>'` with "
     "run_in_background and keep doing other work; you are woken when it is your turn. "
-    "Run `claude-lease release <resource>` as soon as you are done (including verification). "
-    "`claude-lease renew <resource> --minutes N` extends a lease; `claude-lease status` shows everything. "
-    "Order is first come, first served; do not jump the queue unless the user tells you to (--urgent)."
+    "Run `claude-lease release <resource>` as soon as you are done (including verification); "
+    "the same command leaves the queue if you no longer need it. "
+    "`claude-lease renew <resource> --minutes N` makes the lease last until N minutes from now "
+    "(never shorter); `claude-lease status` shows everything. "
+    "Order is first come, first served; --urgent moves you to the front of the queue (it never "
+    "takes the lease from its holder) and is only for when the user tells you to."
 )
 
 
@@ -93,9 +95,25 @@ def remove(path):
         os.remove(path)
 
 
+class ConfigError(Exception):
+    pass
+
+
 def load_config():
-    data = read_json(CONFIG) or {}
-    resources = data.get("resources") or {}
+    """The configured resources. A missing file means none; a file that exists
+    but does not parse raises ConfigError, so it is never mistaken for 'none'."""
+    try:
+        with open(CONFIG) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise ConfigError("%s does not parse: %s" % (CONFIG, e))
+    resources = data.get("resources") if isinstance(data, dict) else None
+    if resources is None:
+        return {}
+    if not isinstance(resources, dict):
+        raise ConfigError("%s: \"resources\" must be an object" % CONFIG)
     return {k: v for k, v in resources.items() if isinstance(v, dict)}
 
 
@@ -196,25 +214,32 @@ def die(msg, code=EXIT_USAGE):
 
 # ---------------------------------------------------------------- core
 
-def prune(res, held):
-    """Drop dead waiters and, while the resource is free, a head that has not
-    been seen for GRACE seconds. Mutex held."""
-    d = rdir(res)
+def live_queue(res, held):
+    """Split the queue into (kept, dropped) without changing anything: waiters
+    whose Claude process is gone are dropped, and while the resource is free a
+    head that has not been seen for GRACE seconds loses its turn."""
     q = queue(res)
-    for e in q:
-        if not pid_alive(e.get("claude_pid")):
-            remove(e["_file"])
-    q = [e for e in q if pid_alive(e.get("claude_pid"))]
+    kept = [e for e in q if pid_alive(e.get("claude_pid"))]
+    dropped = [e for e in q if not pid_alive(e.get("claude_pid"))]
     if not held:
-        fs_path = os.path.join(d, "free_since")
-        free_since = read_json(fs_path)
+        free_since = read_json(os.path.join(rdir(res), "free_since"))
         if not isinstance(free_since, (int, float)):
             free_since = now()
-            write_json(fs_path, free_since)
-        while q and now() - max(free_since, q[0].get("last_seen", 0)) > GRACE:
-            remove(q[0]["_file"])
-            q.pop(0)
-    return q
+        while kept and now() - max(free_since, kept[0].get("last_seen", 0)) > GRACE:
+            dropped.append(kept.pop(0))
+    return kept, dropped
+
+
+def prune(res, held):
+    """Apply live_queue: delete the dropped entries. Mutex held."""
+    if not held:
+        fs_path = os.path.join(rdir(res), "free_since")
+        if not isinstance(read_json(fs_path), (int, float)):
+            write_json(fs_path, now())
+    kept, dropped = live_queue(res, held)
+    for e in dropped:
+        remove(e["_file"])
+    return kept
 
 
 def spawn_holder(res, claude_pid):
@@ -350,6 +375,9 @@ def parse(argv):
                 opts[a[2:]] = next(it)
             except StopIteration:
                 die("%s needs a value" % a)
+        elif a in ("-h", "--help"):
+            print(USAGE)
+            sys.exit(0)
         elif a.startswith("--"):
             die("unknown option %s" % a)
         else:
@@ -357,12 +385,19 @@ def parse(argv):
     return pos, opts
 
 
-def need_resource(pos, config):
-    if not pos:
-        die("which resource? configured: %s" % (", ".join(sorted(config)) or "none"))
-    res = pos[0]
+def known(res, config):
     if res not in config:
         die("unknown resource %r; configured: %s (%s)" % (res, ", ".join(sorted(config)) or "none", CONFIG))
+    return res
+
+
+def need_resource(pos, config, on_this_host=False):
+    if not pos:
+        die("which resource? configured: %s" % (", ".join(sorted(config)) or "none"))
+    res = known(pos[0], config)
+    if on_this_host and not present(config[res]):
+        die("%s is not present on this host (%s does not exist), so there is nothing to lease"
+            % (res, config[res].get("present_if_exists")))
     return res
 
 
@@ -382,7 +417,7 @@ def report_queued(res, info):
 
 
 def cmd_acquire(pos, opts, config):
-    res = need_resource(pos, config)
+    res = need_resource(pos, config, on_this_host=True)
     if not opts.get("purpose"):
         die("--purpose is required so other sessions can see why you hold %s" % res)
     ident = identity(opts)
@@ -396,7 +431,7 @@ def cmd_acquire(pos, opts, config):
 
 
 def cmd_wait(pos, opts, config):
-    res = need_resource(pos, config)
+    res = need_resource(pos, config, on_this_host=True)
     ident = identity(opts)
     minutes = minutes_for(opts, config[res])
     while True:
@@ -436,21 +471,30 @@ def cmd_renew(pos, opts, config):
         if not h or h.get("session_id") != sid:
             print("You do not hold %s." % res)
             return 1
-        h["expires_at"] = now() + minutes * 60
+        wanted = now() + minutes * 60
+        if wanted <= float(h.get("expires_at", 0)):
+            print("UNCHANGED %s: already held until %s, later than %d minute(s) from now "
+                  "(renew never shortens a lease)." % (res, hhmm(h["expires_at"]), round(minutes)))
+            return 0
+        h["expires_at"] = wanted
         write_json(os.path.join(rdir(res), "holder.json"), h)
     print("RENEWED %s until %s." % (res, hhmm(h["expires_at"])))
     return 0
 
 
 def snapshot(config):
+    """State of every resource present on this host. The queue shown is the
+    effective one: entries that have lost their turn are left out even if no
+    acquire has run since to delete them."""
     out = {}
     for res, spec in sorted(config.items()):
         if not present(spec):
             continue
+        h = holder(res)
+        kept, _ = live_queue(res, h is not None)
         out[res] = {"description": spec.get("description", ""),
-                    "holder": holder(res),
-                    "queue": [{k: v for k, v in e.items() if k != "_file"} for e in queue(res)
-                              if pid_alive(e.get("claude_pid"))]}
+                    "holder": h,
+                    "queue": [{k: v for k, v in e.items() if k != "_file"} for e in kept]}
     return out
 
 
@@ -467,11 +511,17 @@ def describe(snap):
 
 
 def cmd_status(pos, opts, config):
+    for res in pos:
+        known(res, config)
+    absent = [r for r in pos if not present(config[r])]
     snap = snapshot({k: v for k, v in config.items() if not pos or k in pos})
     if opts.get("json"):
         print(json.dumps(snap, indent=1))
-    else:
-        print(describe(snap) or "No resources configured for this host (%s)." % CONFIG)
+        return 0
+    lines = [describe(snap)] if snap else []
+    lines += ["- %s: not present on this host (%s does not exist)" % (r, config[r].get("present_if_exists"))
+              for r in absent]
+    print("\n".join(lines) or "No resources configured for this host (%s)." % CONFIG)
     return 0
 
 
@@ -492,24 +542,107 @@ def is_lease_only(command):
     return not any(t and set(t) <= set(";&|()<>") for t in tokens)
 
 
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 CONTROL = {";", ";;", "&", "&&", "|", "||", "|&", "(", ")"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Commands whose arguments run on another host: what they carry is that host's business.
 REMOTE = {"ssh"}
+# A heredoc fed to one of these is commands that run here; fed to anything
+# else (cat, tee, python, ssh ...) it is data, or runs elsewhere.
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+# Words in front of the real command: shell keywords, and wrappers that run
+# the rest of the line unchanged (their own -options are skipped too).
+# Not unwrapped, on purpose: sudo, nice, xargs, eval, `sh -c '...'` (README).
+KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "{", "}", "!"}
+WRAPPERS = {"time", "env", "command", "exec", "nohup", "builtin"}
+SUBST = "__claude_lease_substitution__"
+
+
+def command_words(words):
+    """The words of a simple command from the real command on: VAR=value,
+    shell keywords and the WRAPPERS in front of it are dropped."""
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if ASSIGNMENT.match(w) or w in KEYWORDS:
+            i += 1
+        elif os.path.basename(w) in WRAPPERS:
+            i += 1
+            while i < len(words) and words[i].startswith("-") and words[i] != "-":
+                i += 1
+        else:
+            break
+    return words[i:]
 
 
 def _first_word(text):
-    words = re.split(r"\s+", text.strip())
-    while words and ASSIGNMENT.match(words[0]):
-        words.pop(0)
+    words = command_words(re.split(r"\s+", text.strip()))
     return os.path.basename(words[0]) if words else ""
 
 
-def _drop_remote_heredocs(command):
-    """Remove heredoc bodies fed to a remote command (`ssh host <<EOF ... EOF`);
-    keep the bodies of local ones as commands of their own."""
-    lines, out, i = command.split("\n"), [], 0
+def _split_substitutions(command, quotes=True):
+    """Take out the bodies of `...` and $(...), which run on this host (also
+    inside double quotes and inside an ssh argument in double quotes, since the
+    local shell expands them first). Single-quoted text is left alone; with
+    quotes=False (an unquoted heredoc body) quote characters are literal and
+    protect nothing. Returns the command with each body replaced by a
+    placeholder word, and the bodies."""
+    out, bodies, quote, i, n = [], [], None, 0, len(command)
+    while i < n:
+        ch = command[i]
+        if not quotes and ch in "'\"":
+            out.append(ch)
+            i += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+            out.append(ch)
+            i += 1
+        elif ch == "\\" and i + 1 < n:
+            out.append(command[i:i + 2])
+            i += 2
+        elif ch == "'" and quote is None:
+            quote = "'"
+            out.append(ch)
+            i += 1
+        elif ch == '"':
+            quote = None if quote == '"' else '"'
+            out.append(ch)
+            i += 1
+        elif ch == "`":
+            j = command.find("`", i + 1)
+            if j < 0:
+                out.append(command[i:])
+                break
+            bodies.append(command[i + 1:j])
+            out.append(SUBST)
+            i = j + 1
+        elif command.startswith("$(", i) and not command.startswith("$((", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                depth += {"(": 1, ")": -1}.get(command[j], 0)
+                j += 1
+            if depth:
+                out.append(command[i:])
+                break
+            bodies.append(command[i + 2:j - 1])
+            out.append(SUBST)
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out), bodies
+
+
+def _take_heredocs(command):
+    """Take the heredoc bodies out of a command. Returns the command without
+    them and the extra command texts they contribute on this host:
+    - fed to a shell (`bash <<EOF`): the body is commands;
+    - otherwise (`cat <<EOF`, `git commit -F - <<EOF`, `ssh host <<EOF`) the
+      body is data, but with an unquoted delimiter its `...` and $(...) are
+      still expanded by the local shell, so those bodies are commands;
+    - with a quoted delimiter (<<'EOF') nothing in the body runs here."""
+    lines, out, extra, i = command.split("\n"), [], [], 0
     while i < len(lines):
         line = lines[i]
         out.append(line)
@@ -522,10 +655,13 @@ def _drop_remote_heredocs(command):
             body.append(lines[i])
             i += 1
         i += 1  # the delimiter line
+        text = "\n".join(body)
         owner = re.split(r"&&|\|\||[;&|(]", line[:m.start()])[-1]
-        if _first_word(owner) not in REMOTE:
-            out.extend(body)
-    return "\n".join(out)
+        if _first_word(owner) in SHELLS:
+            extra.append(text)
+        elif not m.group(1):
+            extra.extend(_split_substitutions(text, quotes=False)[1])
+    return "\n".join(out), extra
 
 
 def _newlines_to_separators(command):
@@ -546,11 +682,16 @@ def _newlines_to_separators(command):
     return "".join(out)
 
 
-def simple_commands(command):
+def simple_commands(command, depth=0):
     """Split a Bash command into the simple commands that run on this host:
-    separated by newlines, ; && || | & and parentheses, quotes respected,
-    leading VAR=value dropped, and anything handed to ssh left out."""
-    text = _newlines_to_separators(_drop_remote_heredocs(command.replace("\\\n", " ")))
+    separated by newlines, ; && || | & and parentheses, quotes respected;
+    command substitutions and heredocs fed to a shell included; keywords,
+    VAR=value and plain wrappers in front dropped (command_words); anything
+    handed to ssh left out."""
+    text, heredoc_commands = _take_heredocs(command.replace("\\\n", " "))
+    text, bodies = _split_substitutions(text)
+    bodies += heredoc_commands
+    text = _newlines_to_separators(text)
     try:
         lex = shlex.shlex(text, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
@@ -560,13 +701,15 @@ def simple_commands(command):
     out, cur = [], []
     for t in tokens + [";"]:
         if t in CONTROL:
-            while cur and ASSIGNMENT.match(cur[0]):
-                cur.pop(0)
-            if cur and os.path.basename(cur[0]) not in REMOTE:
-                out.append(" ".join(cur))
+            words = command_words(cur)
+            if words and os.path.basename(words[0]) not in REMOTE:
+                out.append(" ".join(words))
             cur = []
         else:
             cur.append(t)
+    for body in bodies:
+        if depth < 8:
+            out.extend(simple_commands(body, depth + 1))
     return out
 
 
@@ -598,24 +741,29 @@ def hook_pretooluse(data, config):
         h = holder(res)
         if h and h.get("session_id") == sid:
             continue
-        waiting = [e for e in queue(res) if pid_alive(e.get("claude_pid"))]
+        waiting, _ = live_queue(res, h is not None)
+        mine = next((i for i, e in enumerate(waiting) if e.get("session_id") == sid), None)
         desc = (" (%s)" % spec["description"]) if spec.get("description") else ""
+        acquire = "`claude-lease acquire %s --purpose '<why>'`" % res
+        wait = "`claude-lease wait %s --purpose '<why>'` with run_in_background" % res
         if h:
-            msg = ("[claude-lease] %s%s is held by %s for: %s (since %s, until %s); %d waiting. "
-                   "Join the queue with `claude-lease acquire %s --name '<your ListAgents name>' --purpose '<why>'`, "
-                   "then if it prints QUEUED run `claude-lease wait %s` (same flags) with run_in_background "
-                   "and do other work until it wakes you. Do not work around the lease."
+            msg = ("[claude-lease] %s%s is held by %s for: %s (since %s, until %s). "
                    % (res, desc, who(h), h.get("purpose") or "?", hhmm(h.get("acquired_at")),
-                      hhmm(h.get("expires_at")), len(waiting), res, res))
-            if h.get("name"):
-                msg += " To coordinate, SendMessage to %s." % h["name"]
+                      hhmm(h.get("expires_at"))))
         else:
-            msg = ("[claude-lease] %s%s is shared by every Claude session on this machine. Take the lease first: "
-                   "`claude-lease acquire %s --name '<your ListAgents name>' --purpose '<why>'`, then retry, and "
-                   "run `claude-lease release %s` as soon as you have finished (including verification)."
-                   % (res, desc, res, res))
-            if waiting:
-                msg += " %d session(s) are already waiting; you will be queued behind them." % len(waiting)
+            msg = "[claude-lease] %s%s is shared by every Claude session on this machine and is free. " % (res, desc)
+        if mine is not None:
+            msg += ("You are already in the queue at position %d of %d. Make sure %s is running and "
+                    "do other work until it wakes you." % (mine + 1, len(waiting), wait))
+        elif h or waiting:
+            msg += ("%d other session(s) are waiting. Join the queue with %s; if it prints QUEUED, run %s "
+                    "and do other work until it wakes you." % (len(waiting), acquire, wait))
+        else:
+            msg += "Take the lease first with %s, then retry." % acquire
+        msg += (" Release with `claude-lease release %s` as soon as you are done (including verification). "
+                "Do not work around the lease." % res)
+        if h and h.get("name"):
+            msg += " To coordinate, SendMessage to %s." % h["name"]
         reasons.append(msg)
     if not reasons:
         return None
@@ -691,7 +839,10 @@ def main(argv):
         hold(rest[0], int(rest[1]))
         return 0
     pos, opts = parse(rest)
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as e:
+        die(str(e), 1)
     commands = {"acquire": cmd_acquire, "wait": cmd_wait, "release": cmd_release,
                 "renew": cmd_renew, "status": cmd_status}
     if cmd not in commands:

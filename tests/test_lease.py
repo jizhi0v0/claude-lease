@@ -251,6 +251,61 @@ class LeaseTest(unittest.TestCase):
         self.assertIn("LEFT the queue", r.stdout)
         self.assertNotIn("S-b", a.run("status").stdout)
 
+    def test_absent_resource_cannot_be_acquired(self):
+        a = Session(self, "a")
+        for cmd in ("acquire", "wait"):
+            r = a.run(cmd, "absent", "--purpose", "p")
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("not present on this host", r.stderr)
+        r = a.run("status", "absent")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("- absent: not present on this host", r.stdout)
+
+    def test_status_of_unknown_resource_is_an_error(self):
+        a = Session(self, "a")
+        r = a.run("status", "nope")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown resource 'nope'", r.stderr)
+
+    def test_subcommand_help(self):
+        a = Session(self, "a")
+        for cmd in ("acquire", "wait", "release", "renew", "status"):
+            r = a.run(cmd, "--help")
+            self.assertEqual(r.returncode, 0, cmd)
+            self.assertIn("usage:", r.stdout)
+
+    def test_renew_never_shortens(self):
+        a = Session(self, "a")
+        self.acquire(a, "app", "--minutes", "5")
+        before = self.holder()["expires_at"]
+        r = a.run("renew", "app", "--minutes", "1")
+        self.assertIn("UNCHANGED app", r.stdout)
+        self.assertEqual(self.holder()["expires_at"], before)
+        r = a.run("renew", "app", "--minutes", "10")
+        self.assertIn("RENEWED app", r.stdout)
+        self.assertGreater(self.holder()["expires_at"], before + 200)
+
+    def test_broken_config_is_reported(self):
+        a = Session(self, "a")
+        with open(os.path.join(self.home, "resources.json"), "w") as f:
+            f.write("{broken")
+        r = a.run("status")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("does not parse", r.stderr)
+        r = a.run("hook", "pretooluse", stdin=json.dumps({"tool_name": "Bash", "tool_input": {"command": "make install"}}))
+        self.assertEqual((r.returncode, r.stdout), (0, ""), "the hook still fails open")
+        with open(os.path.join(self.home, "hook-errors.log")) as f:
+            self.assertIn("does not parse", f.read())
+
+    def test_status_hides_a_waiter_that_lost_its_turn(self):
+        self.env["CLAUDE_LEASE_GRACE_SECONDS"] = "1"
+        a, b = Session(self, "a"), Session(self, "b")
+        self.acquire(a)
+        self.acquire(b)
+        a.run("release", "app")
+        time.sleep(1.5)
+        self.assertNotIn("S-b", a.run("status").stdout)  # no acquire has run since
+
     def test_unknown_resource(self):
         a = Session(self, "a")
         r = a.run("acquire", "nope", "--purpose", "x")
@@ -310,6 +365,70 @@ class LeaseTest(unittest.TestCase):
             self.assertIsNotNone(a.bash(c), "must be treated as local: %r" % c)
         for c in not_local:
             self.assertIsNone(a.bash(c), "must not match: %r" % c)
+
+    def test_pretooluse_unwraps_keywords_wrappers_and_substitutions(self):
+        a = Session(self, "a")
+        install = "make" + " install"
+        local = [
+            "`%s`" % install,
+            "echo \"`%s`\"" % install,
+            "$(%s)" % install,
+            "echo \"done: $(%s)\"" % install,
+            "x=$(cd y && %s)" % install,
+            "ssh mini \"echo $(%s)\"" % install,  # expanded by the local shell before ssh runs
+            "{ %s; }" % install,
+            "if true; then %s; fi" % install,
+            "while false; do %s; done" % install,
+            "! %s" % install,
+            "time %s" % install,
+            "time -p %s" % install,
+            "env FOO=1 %s" % install,
+            "env -i FOO=1 %s" % install,
+            "command %s" % install,
+            "nohup %s &" % install,
+            # An unquoted heredoc delimiter: the local shell expands the body,
+            # and quote characters in the body protect nothing.
+            "cat <<EOF\nresult: $(%s)\nEOF" % install,
+            "cat <<EOF\n'`%s`'\nEOF" % install,
+            "ssh mini <<EOF\n$(%s)\nEOF" % install,
+            "bash <<'EOF'\n%s\nEOF" % install,
+        ]
+        not_local = [
+            # A quoted delimiter: nothing in the body runs here.
+            "git commit -q -F - <<'EOF'\nfix `if x; then %s; fi` and $(%s)\nEOF" % (install, install),
+            "cat <<\"EOF\"\n$(%s)\nEOF" % install,
+            "ssh mini <<'EOF'\n$(%s)\nEOF" % install,
+            "cat <<X\n%s\nX" % install,
+            "python3 - <<'EOF'\nprint('%s')\nEOF" % install,
+            "cat <<< '%s'" % install,
+            "ssh mini 'echo $(%s)'" % install,
+            "echo '`%s`'" % install,
+            # Documented gaps (README "Guarantees and limits"): not unwrapped on purpose.
+            "sudo %s" % install,
+            "sh -c '%s'" % install,
+        ]
+        for c in local:
+            self.assertIsNotNone(a.bash(c), "must be treated as local: %r" % c)
+        for c in not_local:
+            self.assertIsNone(a.bash(c), "must not match: %r" % c)
+
+    def test_pretooluse_counts_others_and_tells_a_queued_caller_its_place(self):
+        a, b, c = Session(self, "a"), Session(self, "b"), Session(self, "c")
+        self.acquire(a)
+        self.acquire(b)
+        reason = lambda s: s.bash("make install")["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("already in the queue at position 1 of 1", reason(b))
+        self.assertIn("1 other session(s) are waiting", reason(c))
+        a.run("release", "app")
+        r = reason(c)  # free, but b is first in line
+        self.assertIn("is free", r)
+        self.assertIn("1 other session(s) are waiting", r)
+        self.assertIn("already in the queue at position 1 of 1", reason(b))
+
+    def test_mcp_tool_rules_still_match_tool_names_only(self):
+        a = Session(self, "a")
+        self.assertIsNotNone(a.hook("pretooluse", {"tool_name": "mcp__computer-use__computer_batch",
+                                                   "tool_input": {"actions": [{"text": "make install"}]}}))
 
     def test_pretooluse_mcp_tool(self):
         a = Session(self, "a")

@@ -9,10 +9,14 @@ silently replaces the build another session is verifying. With it:
 
 - **Discovery.** A `PreToolUse` hook blocks a tool call that uses a resource the
   session does not hold, and the block message says who holds it (session name
-  from `ListAgents`, folder, branch, purpose, since/until) and how to queue.
+  from `ListAgents`, folder, branch, purpose, since/until), how many other
+  sessions wait, and what to do next (queue, or your place if already queued).
   A `SessionStart` hook puts the current state into every new session's context.
+  A `SessionEnd` hook releases the ending session's leases and takes it out of
+  every queue.
 - **Queueing, not grabbing.** First come, first served, with a time limit.
-  `--urgent` exists only for when the user says so.
+  `--urgent` (only for when the user says so) moves a session to the front of
+  the queue; it never takes the lease away from its holder.
 - **Wake-up on release.** The waiting session runs `claude-lease wait` as a
   background Bash task; it exits when it is that session's turn, which wakes
   the session. Nothing depends on the holder remembering to send a message.
@@ -64,16 +68,37 @@ resources, so they do not take part.
 ```
 
 - `match`: a tool call uses the resource when `tool` matches the tool name and,
-  if given, `input` matches. Regexes, Python syntax. For Bash, `input` is tried
-  against each simple command that runs on this host: the command is split on
-  newlines, `;`, `&&`, `||`, `|`, `&` and parentheses with quotes respected,
-  leading `VAR=value` is dropped, and anything handed to `ssh` (arguments or a
-  heredoc) is left out, because it runs on another host. So anchor patterns
-  with `^`: `^make\s+install(\s|$)` matches `cd x && make install` but not
-  `git commit -m "… make install …"` or `ssh mini 'make install'`.
-  For other tools `input` is tried against the JSON of the tool input.
-- `present_if_exists`: skip the resource on hosts where this path is missing.
-- `ttl_minutes`: default lease length (`--minutes` overrides, `renew` extends).
+  if given, `input` matches. Regexes, Python syntax. For other tools than Bash,
+  `input` is tried against the JSON of the tool input. For Bash, `input` is
+  tried against each simple command that runs on this host, so anchor patterns
+  with `^`. A Bash command is taken apart like this:
+  - split on newlines, `;`, `&&`, `||`, `|`, `&` and parentheses, with quotes respected;
+  - the bodies of `` `…` `` and `$(…)` are commands of their own (also inside
+    double quotes; not inside single quotes);
+  - a heredoc body is commands when fed to a shell (`bash <<EOF`). Fed to
+    anything else (`cat`, `python3 -`, `git commit -F -`, `ssh`) it is data,
+    except that with an unquoted delimiter (`<<EOF`) the local shell still
+    runs the `` `…` `` and `$(…)` in it, whatever quotes surround them; with a
+    quoted delimiter (`<<'EOF'`, `<<"EOF"`) nothing in the body runs here;
+  - in front of the real command, `VAR=value`, the keywords `if then else elif
+    fi while until do done { } !` and the wrappers `time env command exec nohup
+    builtin` (with their own `-options`) are dropped;
+  - a command starting with `ssh` is left out with its arguments and heredoc,
+    because it runs on another host. A `$(…)` in double quotes inside it still
+    counts, because the local shell runs it before `ssh` starts.
+
+  So `^make\s+install(\s|$)` matches `cd x && make install`,
+  `if ok; then make install; fi`, `time make install` and `echo "$(make install)"`,
+  but not `git commit -m "… make install …"`, `cat <<EOF` text that mentions it,
+  or `ssh mini 'make install'`.
+- `present_if_exists`: the resource only exists on hosts where this path does.
+  Elsewhere it is not shown, never blocks anything, and cannot be acquired.
+- `ttl_minutes`: default lease length; `--minutes` overrides it per call.
+  Minutes may be fractional (`--minutes 0.5`).
+
+A `resources.json` that does not parse is an error: commands exit 1 and say so,
+and the hook lets every call through and logs it to
+`~/.claude/lease/hook-errors.log`. A missing file means no resources.
 
 Lease what is actually shared and for as long as it is shared: for an app that
 is the deploy *and* the verification after it, not the compile before it.
@@ -81,13 +106,25 @@ is the deploy *and* the verification after it, not the compile before it.
 ## Use (what Claude does)
 
 ```bash
-claude-lease acquire duo-app --name '<ListAgents name>' --purpose 'verify #1312 tooltip'
+claude-lease acquire duo-app --purpose 'verify #1312 tooltip'
 # exit 0: ACQUIRED   exit 3: QUEUED -> then, as a background task:
-claude-lease wait duo-app --name '<ListAgents name>' --purpose 'verify #1312 tooltip'
+claude-lease wait duo-app --purpose 'verify #1312 tooltip'
 claude-lease renew duo-app --minutes 30
 claude-lease release duo-app
-claude-lease status [--json]
+claude-lease status [resource...] [--json]
+claude-lease <command> --help
 ```
+
+- `release` gives the lease back, or, for a session that is only queued,
+  leaves the queue. Either way it exits 0; it exits 1 when there was nothing
+  to give back.
+- `renew --minutes N` makes the lease last until N minutes from now
+  (`ttl_minutes` without `--minutes`). It never shortens a lease: if the lease
+  already lasts longer, it prints `UNCHANGED` and keeps the later time.
+- `status` lists every resource present on this host, or the named ones. A
+  named resource that is not configured is an error (exit 2); one that is
+  configured but not present on this host is listed as such.
+- Exit codes: 0 ok, 3 queued, 2 usage error, 1 failure.
 
 `--name` is the session's name as `ListAgents` shows it, so a blocked session
 can `SendMessage` the holder. When it is left out, it is read from Claude Code's
@@ -100,17 +137,27 @@ CLAUDE.md instructions are needed.
 
 A queued session that has neither a running `wait` nor called `acquire` for
 120 s (`CLAUDE_LEASE_GRACE_SECONDS`) while the resource is free loses its turn.
-Waiters whose Claude Code process is gone are dropped.
+Waiters whose Claude Code process is gone are dropped. `status` and the hooks
+already show the queue without them; their queue files are deleted at the next
+`acquire`, `wait` or `release`.
+
+A lease belongs to a Claude Code process (`$CLAUDE_PID`), and a subagent runs
+in its parent's process: a subagent shares its parent session's leases and
+place in the queue, and its default `--name` is the parent's.
 
 ## Guarantees and limits
 
-- Advisory: it only governs tool calls that match a rule. A command spelled
-  differently (`bash -c '…'`, `sudo …`, a wrapper script), or a human in a
-  terminal, is not stopped.
-- `ssh host '…'` is never matched: the host it reaches has its own leases
-  (install claude-lease there), and a lease cannot be held across hosts.
-- The hook fails open: any error leaves the call alone and is logged to
-  `~/.claude/lease/hook-errors.log`. A broken lease system must not break sessions.
+- Advisory: it only governs tool calls that match a rule. Not taken apart, on
+  purpose: `sudo …`, `nice …`, `xargs …`, `eval …`, `sh -c '…'`/`bash -c '…'`,
+  and anything inside a script or Makefile the command runs. Those, and a
+  human in a terminal, are not stopped.
+- What `ssh host '…'` runs on the other host is never matched: that host has
+  its own leases (install claude-lease there), and a lease cannot be held
+  across hosts.
+- The hook fails open: any error (unparseable input, a broken
+  `resources.json`, a bad regex) leaves the call alone and is logged to
+  `~/.claude/lease/hook-errors.log`. Empty input is treated as no tool call,
+  not as an error. A broken lease system must not break sessions.
 - One host. State lives in `~/.claude/lease/state/`.
 
 ## Test
