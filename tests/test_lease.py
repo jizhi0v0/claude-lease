@@ -412,6 +412,60 @@ class LeaseTest(unittest.TestCase):
         for c in not_local:
             self.assertIsNone(a.bash(c), "must not match: %r" % c)
 
+    def test_pretooluse_skips_wrapper_options_and_their_values(self):
+        a = Session(self, "a")
+        install = "make" + " install"
+        local = [
+            "exec -a foo %s" % install,
+            "env -C /tmp %s" % install,
+            "env -u X %s" % install,
+            "env --unset=X %s" % install,
+            "env --chdir /tmp FOO=1 %s" % install,
+            "env -i -u X FOO=1 %s" % install,
+            "env -- %s" % install,
+            "env -S '%s'" % install,
+            "env --split-string='FOO=1 %s'" % install,
+            "time -o /tmp/t %s" % install,
+            "time -f '%%e' %s" % install,
+            "time env -C /tmp nohup %s" % install,
+        ]
+        for c in local:
+            self.assertIsNotNone(a.bash(c), "must be treated as local: %r" % c)
+        # A value that only looks like the command is still just a value.
+        self.assertIsNone(a.bash("env -u make install-tools"))
+
+    def test_queue_entry_follows_the_session(self):
+        a, b = Session(self, "a"), Session(self, "b")
+        self.acquire(a)
+        repo = tempfile.mkdtemp(prefix="claude-lease-git-")
+        self.addCleanup(shutil.rmtree, repo, True)
+        for args in (["init", "-q", "-b", "lease-test"],
+                     ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]):
+            subprocess.run(["git"] + args, cwd=repo, check=True, env=self.env, capture_output=True)
+        p = subprocess.run([sys.executable, BIN, "acquire", "app", "--name", "S-b", "--purpose", "first"],
+                           env=b.env(), cwd=repo, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 3)
+        q = os.path.join(self.home, "state", "app", "queue")
+        with open(os.path.join(q, os.listdir(q)[0])) as f:
+            self.assertEqual(json.load(f)["branch"], "lease-test", "precondition: queued from a branch")
+        outside = tempfile.mkdtemp(prefix="claude-lease-nogit-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        p = subprocess.run([sys.executable, BIN, "acquire", "app", "--purpose", "second"],
+                           env=b.env(), cwd=outside, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 3)
+        (entry_file,) = os.listdir(q)
+        with open(os.path.join(q, entry_file)) as f:
+            e = json.load(f)
+        self.assertEqual(os.path.realpath(e["cwd"]), os.path.realpath(outside))
+        self.assertEqual(e["branch"], "", "no git repo there: no branch, not the old one")
+        self.assertEqual(e["purpose"], "second")
+        self.assertEqual(e["name"], "S-b", "kept when not given again")
+
+    def test_unchanged_message_keeps_fractional_minutes(self):
+        a = Session(self, "a")
+        self.acquire(a, "app", "--minutes", "5")
+        self.assertIn("later than 0.5 minute(s) from now", a.run("renew", "app", "--minutes", "0.5").stdout)
+
     def test_pretooluse_counts_others_and_tells_a_queued_caller_its_place(self):
         a, b, c = Session(self, "a"), Session(self, "b"), Session(self, "c")
         self.acquire(a)

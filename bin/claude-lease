@@ -294,7 +294,10 @@ def try_acquire(res, ident, minutes, urgent=False):
         if mine:
             entry = mine[0]
             path = entry.pop("_file")
-            entry.update({k: v for k, v in ident.items() if v})
+            # Where the session is now (cwd, branch, socket) always replaces the
+            # old values, even when empty (cwd outside a git repo: no branch);
+            # name and purpose are kept when this call did not give new ones.
+            entry.update({k: v for k, v in ident.items() if v or k not in ("name", "purpose")})
             write_json(path, entry)
         else:
             prefix = "%020d" % (0 if urgent else int(now() * 1e6))
@@ -473,8 +476,8 @@ def cmd_renew(pos, opts, config):
             return 1
         wanted = now() + minutes * 60
         if wanted <= float(h.get("expires_at", 0)):
-            print("UNCHANGED %s: already held until %s, later than %d minute(s) from now "
-                  "(renew never shortens a lease)." % (res, hhmm(h["expires_at"]), round(minutes)))
+            print("UNCHANGED %s: already held until %s, later than %g minute(s) from now "
+                  "(renew never shortens a lease)." % (res, hhmm(h["expires_at"]), minutes))
             return 0
         h["expires_at"] = wanted
         write_json(os.path.join(rdir(res), "holder.json"), h)
@@ -554,24 +557,50 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 # the rest of the line unchanged (their own -options are skipped too).
 # Not unwrapped, on purpose: sudo, nice, xargs, eval, `sh -c '...'` (README).
 KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "{", "}", "!"}
-WRAPPERS = {"time", "env", "command", "exec", "nohup", "builtin"}
+# Each wrapper with the options of its own that take a value (macOS and GNU
+# spellings). env -S/--split-string is special: its value is the command line.
+WRAPPERS = {
+    "time": {"-f", "-o", "--format", "--output"},
+    "env": {"-u", "-C", "-P", "-S", "--unset", "--chdir", "--split-string"},
+    "command": set(),
+    "exec": {"-a"},
+    "nohup": set(),
+    "builtin": set(),
+}
+SPLIT_STRING = {"-S", "--split-string"}
 SUBST = "__claude_lease_substitution__"
 
 
 def command_words(words):
     """The words of a simple command from the real command on: VAR=value,
-    shell keywords and the WRAPPERS in front of it are dropped."""
-    i = 0
+    shell keywords and the WRAPPERS in front of it are dropped, with their own
+    options and those options' values (`env -C dir`, `exec -a name`,
+    `time -o file`); `env -S 'cmd args'` unpacks its value as the command."""
+    words, i = list(words), 0
     while i < len(words):
         w = words[i]
         if ASSIGNMENT.match(w) or w in KEYWORDS:
             i += 1
-        elif os.path.basename(w) in WRAPPERS:
-            i += 1
-            while i < len(words) and words[i].startswith("-") and words[i] != "-":
-                i += 1
-        else:
+            continue
+        takes_value = WRAPPERS.get(os.path.basename(w))
+        if takes_value is None:
             break
+        i += 1
+        while i < len(words) and words[i].startswith("-") and words[i] != "-":
+            opt = words[i]
+            i += 1
+            if opt == "--":
+                break
+            name, eq, value = opt.partition("=")
+            if name in takes_value and not eq and i < len(words):
+                value = words[i]
+                i += 1
+            elif not (name in takes_value and eq):
+                continue
+            if name in SPLIT_STRING:
+                with contextlib.suppress(ValueError):
+                    words[i:i] = shlex.split(value)
+                break
     return words[i:]
 
 

@@ -82,10 +82,15 @@ resources, so they do not take part.
     quoted delimiter (`<<'EOF'`, `<<"EOF"`) nothing in the body runs here;
   - in front of the real command, `VAR=value`, the keywords `if then else elif
     fi while until do done { } !` and the wrappers `time env command exec nohup
-    builtin` (with their own `-options`) are dropped;
-  - a command starting with `ssh` is left out with its arguments and heredoc,
-    because it runs on another host. A `$(…)` in double quotes inside it still
-    counts, because the local shell runs it before `ssh` starts.
+    builtin` are dropped, together with the wrappers' own options and those
+    options' values (`env -C dir`, `env -u NAME`, `exec -a name`,
+    `time -o file`, `--opt=value`, `--`); the value of `env -S`/`--split-string`
+    is unpacked as the command itself;
+  - a command starting with `ssh` is left out together with its arguments,
+    because they run on another host. Two things in it still run here first
+    and therefore count: a `$(…)` or `` `…` `` in double quotes in its
+    arguments, and one in a heredoc fed to it with an unquoted delimiter (the
+    heredoc rule above).
 
   So `^make\s+install(\s|$)` matches `cd x && make install`,
   `if ok; then make install; fi`, `time make install` and `echo "$(make install)"`,
@@ -112,7 +117,7 @@ claude-lease wait duo-app --purpose 'verify #1312 tooltip'
 claude-lease renew duo-app --minutes 30
 claude-lease release duo-app
 claude-lease status [resource...] [--json]
-claude-lease <command> --help
+claude-lease <command> --help     # the same usage text as claude-lease --help
 ```
 
 - `release` gives the lease back, or, for a session that is only queued,
@@ -125,6 +130,9 @@ claude-lease <command> --help
   named resource that is not configured is an error (exit 2); one that is
   configured but not present on this host is listed as such.
 - Exit codes: 0 ok, 3 queued, 2 usage error, 1 failure.
+- `acquire`, `wait`, `release` and `renew` need to run inside a Claude Code
+  session (they read `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID`); elsewhere they
+  exit 2 and say so. `status` works anywhere.
 
 `--name` is the session's name as `ListAgents` shows it, so a blocked session
 can `SendMessage` the holder. When it is left out, it is read from Claude Code's
@@ -138,19 +146,26 @@ CLAUDE.md instructions are needed.
 A queued session that has neither a running `wait` nor called `acquire` for
 120 s (`CLAUDE_LEASE_GRACE_SECONDS`) while the resource is free loses its turn.
 Waiters whose Claude Code process is gone are dropped. `status` and the hooks
-already show the queue without them; their queue files are deleted at the next
-`acquire`, `wait` or `release`.
+already show the queue without them; their queue files are deleted by the next
+`acquire`, `release` or check of any running `wait` (a running `wait` checks
+about once a second).
 
-A lease belongs to a Claude Code process (`$CLAUDE_PID`), and a subagent runs
-in its parent's process: a subagent shares its parent session's leases and
-place in the queue, and its default `--name` is the parent's.
+A lease, and a place in the queue, belong to a session: the session ID
+(`$CLAUDE_CODE_SESSION_ID`; the hook uses the `session_id` of its input) says
+whose it is, and the lease ends when that session's Claude Code process
+(`$CLAUDE_PID`) exits. A subagent has its parent's session ID and process, so
+it shares its parent's leases and place in the queue, and its default `--name`
+is the parent's. Each call records where the session is now: a queue entry
+shows the folder and branch of the session's latest `acquire` or `wait`.
 
 ## Guarantees and limits
 
 - Advisory: it only governs tool calls that match a rule. Not taken apart, on
   purpose: `sudo …`, `nice …`, `xargs …`, `eval …`, `sh -c '…'`/`bash -c '…'`,
-  and anything inside a script or Makefile the command runs. Those, and a
-  human in a terminal, are not stopped.
+  and anything inside a script or Makefile the command runs. Nor does a
+  configured pattern match more than it says: `^make\s+install` does not
+  cover `bash scripts/install.sh`. Those, and a human in a terminal, are not
+  stopped.
 - What `ssh host '…'` runs on the other host is never matched: that host has
   its own leases (install claude-lease there), and a lease cannot be held
   across hosts.
