@@ -75,6 +75,8 @@ resources, so they do not take part.
   tried against each simple command that runs on this host, so anchor patterns
   with `^`. A Bash command is taken apart like this:
   - split on newlines, `;`, `&&`, `||`, `|`, `&` and parentheses, with quotes respected;
+  - a `#` that starts a word outside quotes comments out the rest of its line,
+    a `<<` in it included; a `#` inside a word (`a#b`, `\#`, `'#'`) is text;
   - the bodies of `` `…` `` and `$(…)` are commands of their own (also inside
     double quotes; not inside single quotes);
   - a heredoc body is commands when fed to a shell (`bash <<EOF`). Fed to
@@ -190,10 +192,11 @@ shows the folder and branch of the session's latest `acquire` or `wait`.
 
 Found by testing and left as they are for now.
 
-- **A `<<` inside a `#` comment can hide later lines (lets a call through).**
-  The heredoc rule does not know about comments, so in `# note <<EOF`
-  followed by a newline and `make install`, everything after the commented
-  `<<EOF` is taken for heredoc data and not checked, although bash runs it.
+- **A comment that ends in `\` can hide the next line (lets a call through).**
+  A backslash at the end of a line is joined with the next line before
+  comments are looked at, so in `echo hi # note \` followed by a newline and
+  `make install`, the second line is read as part of the comment, although
+  bash ends a comment at the newline and runs it.
 - **`$'…'` strings are not fully understood (blocks too much).** In bash's
   ANSI-C quoting a `\'` does not end the string. Finding heredocs knows this;
   the rest of the matching does not, so text after a `\'` in the same `$'…'`,

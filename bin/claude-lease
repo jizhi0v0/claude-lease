@@ -537,6 +537,7 @@ def is_lease_only(command):
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
+        lex.commenters = ""  # shlex would cut at any #, a#b included
         tokens = list(lex)
     except ValueError:
         return False
@@ -664,14 +665,18 @@ def _split_substitutions(command, quotes=True):
 
 
 def _find_heredoc(line, quote):
-    """The first heredoc operator in a line that is outside quotes, and the
-    quote still open where the scan stopped. `quote` is the quote open at the
-    start of the line ("'", '"', "$'" or None), since quotes span lines. In
-    "..." and $'...' a backslash escapes the next character (so $'it\\'s' is
-    one string); in '...' it does not."""
-    i, n = 0, len(line)
+    """The first heredoc operator in a line that is outside quotes, the quote
+    still open where the scan stopped, and where the line's comment starts
+    (len(line) if it has none). `quote` is the quote open at the start of the
+    line ("'", '"', "$'" or None), since quotes span lines. In "..." and
+    $'...' a backslash escapes the next character (so $'it\\'s' is one
+    string); in '...' it does not. An unquoted # that starts a word comments
+    out the rest of the line, a << in it included; a # inside a word (a#b,
+    \\#, '#') does not."""
+    i, n, found, word_start = 0, len(line), None, True
     while i < n:
         ch = line[i]
+        at_word_start, word_start = word_start, False
         if quote == "'":
             if ch == "'":
                 quote = None
@@ -682,17 +687,19 @@ def _find_heredoc(line, quote):
                 quote = None
         elif ch == "\\":
             i += 1
+        elif ch == "#" and at_word_start:
+            return found, quote, i
         elif line.startswith("$'", i):
             quote = "$'"
             i += 1
         elif ch in "'\"":
             quote = ch
-        elif ch == "<":
-            m = HEREDOC.match(line, i)
-            if m:
-                return m, quote
+        else:
+            word_start = ch in " \t;&|()<>"
+            if ch == "<" and not found:
+                found = HEREDOC.match(line, i)
         i += 1
-    return None, quote
+    return found, quote, n
 
 
 def _take_heredocs(command):
@@ -705,10 +712,10 @@ def _take_heredocs(command):
     - with a quoted delimiter (<<'EOF') nothing in the body runs here."""
     lines, out, extra, i, quote = command.split("\n"), [], [], 0, None
     while i < len(lines):
-        line = lines[i]
+        m, quote, end = _find_heredoc(lines[i], quote)
+        line = lines[i][:end]
         out.append(line)
         i += 1
-        m, quote = _find_heredoc(line, quote)
         if not m:
             continue
         quote = None
@@ -757,6 +764,7 @@ def simple_commands(command, depth=0):
     try:
         lex = shlex.shlex(text, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
+        lex.commenters = ""  # comments are gone (_take_heredocs); shlex would cut at a#b
         tokens = list(lex)
     except ValueError:
         return [command]  # unbalanced quotes: fall back to the raw text

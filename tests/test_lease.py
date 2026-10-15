@@ -435,6 +435,40 @@ class LeaseTest(unittest.TestCase):
         for c in not_local:
             self.assertIsNone(a.bash(c), "must not match: %r" % c)
 
+    def test_pretooluse_comment_ends_at_its_line(self):
+        a = Session(self, "a")
+        install = "make" + " install"
+        local = [
+            # A << in a comment is not a heredoc, so the next line is a command.
+            "echo hi # <<EOF\n%s" % install,
+            "echo hi;# <<EOF\n%s" % install,
+            "# <<EOF\n%s" % install,
+            # A comment ends at its newline.
+            "echo hi # note\n%s" % install,
+            # A # inside a word does not start a comment.
+            "echo a#b; %s" % install,
+            "echo \\#b; %s" % install,
+            "echo '#'b; %s" % install,
+            "claude-lease status a#b; %s" % install,
+            "claude-lease status # note; x\n%s" % install,
+            # In heredoc data a # line is data, and its $(...) still runs here.
+            "cat <<EOF\n# $(%s)\nEOF" % install,
+        ]
+        not_local = [
+            "true # %s" % install,
+            "# %s" % install,
+            "true;#%s" % install,
+            "true # x; %s" % install,
+            "true # $(%s)" % install,
+            # A << before the comment still starts a heredoc.
+            "cat <<EOF # note\n%s\nEOF" % install,
+            "echo '#' <<EOF\n%s\nEOF" % install,
+        ]
+        for c in local:
+            self.assertIsNotNone(a.bash(c), "must be treated as local: %r" % c)
+        for c in not_local:
+            self.assertIsNone(a.bash(c), "must not match: %r" % c)
+
     def test_pretooluse_skips_wrapper_options_and_their_values(self):
         a = Session(self, "a")
         install = "make" + " install"
