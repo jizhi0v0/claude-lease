@@ -218,3 +218,7 @@ Found by testing and left as they are for now.
 ```bash
 python3 -m unittest -v tests/test_lease.py
 ```
+
+## License
+
+MIT; see [LICENSE](LICENSE).
